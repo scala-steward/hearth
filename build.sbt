@@ -2,10 +2,15 @@ import com.jsuereth.sbtpgp.PgpKeys.publishSigned
 import com.typesafe.tools.mima.core.{Problem, ProblemFilters}
 import sbtwelcome.UsefulTask
 import commandmatrix.extra.*
+import sbt.ThisBuild
+import org.scalafmt.sbt.ScalafmtPlugin.autoImport.scalafmtOnCompile
 
 // Used to configure the build so that it would format+compile during development but not on CI.
 lazy val isCI = sys.env.get("CI").contains("true")
 ThisBuild / scalafmtOnCompile := !isCI
+
+// Used to compile tests against the newest Scala versions, to check for regressions.
+lazy val isNewestScalaTests = sys.env.get("NEWEST_SCALA_TESTS").contains("true")
 
 // Used to publish snapshots to Maven Central.
 val mavenCentralSnapshots = "Maven Central Snapshots" at "https://central.sonatype.com/repository/maven-snapshots"
@@ -14,8 +19,12 @@ val mavenCentralSnapshots = "Maven Central Snapshots" at "https://central.sonaty
 
 val versions = new {
   // Versions we are publishing for.
-  val scala213 = "2.13.17"
+  val scala213 = "2.13.16"
   val scala3 = "3.3.7"
+
+  // Versions we can compile tests against if needed, to check for regressions.
+  val scala213Newest = "2.13.17"
+  val scala3Newest = "3.7.3"
 
   // Which versions should be cross-compiled for publishing.
   val scalas = List(scala213, scala3)
@@ -186,9 +195,9 @@ val settings = Seq(
       "-Wunused:params",
       "-Wvalue-discard",
       "-Xfatal-warnings",
-      "-Xcheck-macros",
-      "-Ykind-projector:underscores"
-    ),
+      "-Xcheck-macros"
+    ) ++ (if (scalaVersion.value == versions.scala3Newest) Seq("-Xkind-projector:underscores")
+          else Seq("-Ykind-projector:underscores")),
     for2_13 = Seq(
       // format: off
       "-encoding", "UTF-8",
@@ -227,13 +236,20 @@ val settings = Seq(
       "-Ywarn-unused:imports",
       "-Ywarn-macros:after",
       "-Ytasty-reader"
-    )
+    ) ++
+      (if (scalaVersion.value == versions.scala213Newest)
+         Seq(
+           "-Wconf:msg=a type was inferred to be kind-polymorphic `Nothing` to conform to:s", // silence warn that appeared after updating to Scala 2.13.17
+           "-Xsource-features:eta-expand-always" // silence warn that appears since 2.13.17
+         )
+       else Seq.empty)
   ),
   Compile / doc / scalacOptions ++= versions.fold(scalaVersion.value)(
     for3 = Seq("-Ygenerate-inkuire"), // type-based search for Scala 3, this option cannot go into compile
     for2_13 = Seq.empty
   ),
-  Compile / console / scalacOptions --= Seq("-Ywarn-unused:imports", "-Xfatal-warnings")
+  Compile / console / scalacOptions --= Seq("-Ywarn-unused:imports", "-Xfatal-warnings"),
+  coverageScalacPluginVersion := "2.4.0" // update, since sbt-scoverage was not updated
 )
 
 val dependencies = Seq(
@@ -242,11 +258,11 @@ val dependencies = Seq(
     "org.scalacheck" %%% "scalacheck" % versions.scalacheck % Test
   ),
   libraryDependencies ++= versions.fold(scalaVersion.value)(
+    for3 = Seq.empty,
     for2_13 = Seq(
       "org.scala-lang" % "scala-reflect" % scalaVersion.value % Provided,
       compilerPlugin("org.typelevel" % "kind-projector" % versions.kindProjector cross CrossVersion.full)
-    ),
-    for3 = Seq.empty
+    )
   )
 )
 
@@ -437,13 +453,10 @@ lazy val hearthCrossQuotes = projectMatrix
     moduleName := "hearth-cross-quotes",
     name := "hearth-cross-quotes",
     description := "Utilities for hurting little kittens",
-    libraryDependencies ++= {
-      CrossVersion.partialVersion(scalaVersion.value) match {
-        case Some((3, _)) => Seq("org.scala-lang" %% "scala3-compiler" % scalaVersion.value)
-        case Some((2, _)) => Seq("org.scala-lang" % "scala-compiler" % scalaVersion.value)
-        case _            => ???
-      }
-    }
+    libraryDependencies ++= versions.fold(scalaVersion.value)(
+      for3 = Seq("org.scala-lang" %% "scala3-compiler" % scalaVersion.value),
+      for2_13 = Seq("org.scala-lang" % "scala-compiler" % scalaVersion.value)
+    )
   )
   .settings(settings *)
   .settings(versionSchemeSettings *)
@@ -457,7 +470,11 @@ lazy val hearthMicroFp = projectMatrix
   .settings(
     moduleName := "hearth-micro-fp",
     name := "hearth-micro-fp",
-    description := "Micro FP library, for using a few useful extension without fetching a whole FP library"
+    description := "Micro FP library, for using a few useful extension without fetching a whole FP library",
+    scalacOptions ++= versions.fold(scalaVersion.value)(
+      for3 = Seq.empty,
+      for2_13 = Seq("-opt:l:inline") // we have a few @inline for micro-optimisations in micro-fp
+    )
   )
   .settings(settings *)
   .settings(versionSchemeSettings *)
@@ -513,6 +530,16 @@ lazy val hearthTests = projectMatrix
   .settings(dependencies *)
   .settings(mimaSettings *)
   .dependsOn(hearth)
+  // update Scala version to the newest one if needed, but do it only at the end
+  .settings(
+    scalaVersion := {
+      scalaVersion.value match {
+        case versions.scala213 if isNewestScalaTests => versions.scala213Newest
+        case versions.scala3 if isNewestScalaTests   => versions.scala3Newest
+        case current                                 => current
+      }
+    }
+  )
 
 // Test cross compilation: 2.13x3
 
